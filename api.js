@@ -2,6 +2,8 @@ require('dotenv').config();
 const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
 const session = require('express-session');
+const path = require('path');
+const fs = require('fs');
 
 // 환경변수 체크
 if (!process.env.SESSION_SECRET) {
@@ -16,6 +18,13 @@ if (!process.env.AUTH_TOKEN) {
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+
+// photos 디렉토리 설정
+const PHOTOS_DIR = path.join(__dirname, 'photos');
+if (!fs.existsSync(PHOTOS_DIR)) {
+    fs.mkdirSync(PHOTOS_DIR);
+    console.log('✅ Photos directory created');
+}
 
 // sensor_data.db 사용하도록 변경
 const db = new sqlite3.Database('./sensor_data.db', (err) => {
@@ -270,6 +279,39 @@ app.post('/api/sensor-settings/:sensorType', (req, res) => {
                 details: err.message 
             });
         }
+    });
+});
+
+app.get('/api/latest-photo', (req, res) => {
+    const PHOTOS_DIR = path.join(__dirname, 'photos');
+
+    fs.readdir(PHOTOS_DIR, (err, files) => {
+        if (err) {
+            return res.status(500).json({ error: 'Failed to read directory' });
+        }
+
+        // 이미지 파일만 필터링
+        const imageFiles = files.filter(file => {
+            const ext = path.extname(file).toLowerCase();
+            return ['.jpg', '.jpeg', '.png', '.gif'].includes(ext);
+        });
+
+        if (imageFiles.length === 0) {
+            return res.status(404).json({ error: 'No photos found' });
+        }
+
+        // 각 파일의 수정 시간 확인
+        const fileStats = imageFiles.map(file => ({
+            name: file,
+            time: fs.statSync(path.join(PHOTOS_DIR, file)).mtime.getTime()
+        }));
+
+        // 수정 시간 기준 정렬
+        fileStats.sort((a, b) => b.time - a.time);
+
+        // 가장 최근 파일 전송
+        const latestFile = path.join(PHOTOS_DIR, fileStats[0].name);
+        res.sendFile(latestFile);
     });
 });
 
