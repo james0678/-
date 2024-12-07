@@ -148,7 +148,7 @@ const fetchData = (tableName, params, callback) => {
         return callback(new Error('Invalid table name'), null);
     }
 
-    let query = `SELECT * FROM ${tableName}`;
+    let query = `SELECT *, '${tableName}' as table_name FROM ${tableName}`;
     const queryParams = [];
 
     if (params.start && params.end) {
@@ -179,10 +179,14 @@ const createEndpoint = (tableName) => {
                 });
             } else if (!rows.length) {
                 res.status(404).json({ 
+                    table: tableName,
                     error: `No data found in ${tableName}` 
                 });
             } else {
-                res.json(rows);
+                res.json({
+                    table: tableName,
+                    data: rows
+                });
             }
         });
     });
