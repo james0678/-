@@ -101,6 +101,14 @@ function initializeTables() {
             location TEXT,
             feed_amount REAL,
             status TEXT
+        )`,
+        `CREATE TABLE IF NOT EXISTS tb_sensor_settings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sensor_type TEXT,
+            setting_name TEXT,
+            setting_value REAL,
+            updated_at TEXT,
+            UNIQUE(sensor_type, setting_name)
         )`
     ];
 
@@ -198,6 +206,72 @@ const createEndpoint = (tableName) => {
     'tb_illuminance', 'tb_conductivity', 'tb_air_pump',
     'tb_water_pump', 'tb_alert', 'tb_feed'
 ].forEach(createEndpoint);
+
+// POST 요청을 위한 JSON 파서 미들웨어 추가
+app.use(express.json());
+
+// 센서 설정값 조회 API
+app.get('/api/sensor-settings/:sensorType', (req, res) => {
+    const { sensorType } = req.params;
+    
+    db.all(
+        'SELECT * FROM tb_sensor_settings WHERE sensor_type = ?',
+        [sensorType],
+        (err, rows) => {
+            if (err) {
+                res.status(500).json({ error: 'Database error', details: err.message });
+            } else {
+                res.json({ settings: rows });
+            }
+        }
+    );
+});
+
+// 센서 설정값 업데이트 API
+app.post('/api/sensor-settings/:sensorType', (req, res) => {
+    const { sensorType } = req.params;
+    const { settings } = req.body;
+    
+    if (!settings || !Array.isArray(settings)) {
+        return res.status(400).json({ error: 'Invalid settings format' });
+    }
+
+    const timestamp = new Date().toISOString();
+    
+    // 트랜잭션 시작
+    db.serialize(() => {
+        db.run('BEGIN TRANSACTION');
+
+        try {
+            settings.forEach(setting => {
+                db.run(
+                    `INSERT INTO tb_sensor_settings (sensor_type, setting_name, setting_value, updated_at)
+                     VALUES (?, ?, ?, ?)
+                     ON CONFLICT(sensor_type, setting_name) 
+                     DO UPDATE SET setting_value = ?, updated_at = ?`,
+                    [sensorType, setting.name, setting.value, timestamp, setting.value, timestamp]
+                );
+            });
+
+            db.run('COMMIT', (err) => {
+                if (err) {
+                    throw err;
+                }
+                res.json({ 
+                    message: 'Settings updated successfully',
+                    sensorType,
+                    timestamp 
+                });
+            });
+        } catch (err) {
+            db.run('ROLLBACK');
+            res.status(500).json({ 
+                error: 'Failed to update settings',
+                details: err.message 
+            });
+        }
+    });
+});
 
 // 404 에러 처리
 app.use((req, res) => {
