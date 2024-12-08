@@ -1,3 +1,12 @@
+// # 필요한 라이브러리 설치
+// sudo apt-get install libcurl4-openssl-dev libjson-c-dev wiringpi
+
+// # 컴파일
+// gcc -o pumpControl pumpControl.c -lwiringPi -ljson-c -lcurl
+
+// # 실행
+// ./pumpControl
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -5,22 +14,22 @@
 #include <wiringPi.h>
 #include <wiringPiSPI.h>
 #include <signal.h>
+#include <curl/curl.h>
+#include <json-c/json.h>
 
 #define SPI_CHANNEL 0
 #define SPI_SPEED 1350000
 #define QUEUE_SIZE 10
 #define PUMPS_RELAY_PIN 16  // GPIO 16 (물리적 핀 36)
 
-// pH 임계값 설정
-#define PH_THRESHOLD 6.5    // pH가 6.5 이하면 펌프 작동
-#define WATER_LEVEL_LOW 2.0 // 수위가 2.0V 이하면 펌프 중지
-
-// pH 센서 관련 상수 추가
-#define REFERENCE_VOLTAGE 4.02  // 기준 전압
-#define REFERENCE_PH 6.48       // 기준 pH
-#define SLOPE -59.2             // mV/pH at 25°C (네른스트 방정식)
+// pH 센서 관련 상수
+#define REFERENCE_VOLTAGE 4.99  // 기준 전압
+#define REFERENCE_PH 6.00      // 기준 pH
+#define SLOPE -59.2            // mV/pH at 25°C (네른스트 방정식)
+#define PH_TOLERANCE 0.5       // pH 허용 오차 범위
 
 static int running = 1;
+static double target_ph = 7.0;  // 초기 목표 pH 값
 
 // 이동 평균 필터 구조체
 typedef struct {
@@ -28,6 +37,108 @@ typedef struct {
     int head;
     int count;
 } MovingAverage;
+
+// API 응답을 위한 구조체
+struct MemoryStruct {
+    char *memory;
+    size_t size;
+};
+
+// API 응답 처리 콜백
+static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp) {
+    size_t realsize = size * nmemb;
+    struct MemoryStruct *mem = (struct MemoryStruct *)userp;
+    
+    char *ptr = realloc(mem->memory, mem->size + realsize + 1);
+    if(!ptr) return 0;
+    
+    mem->memory = ptr;
+    memcpy(&(mem->memory[mem->size]), contents, realsize);
+    mem->size += realsize;
+    mem->memory[mem->size] = 0;
+    
+    return realsize;
+}
+
+// pH 설정값 가져오기
+double fetch_ph_setting() {
+    CURL *curl;
+    CURLcode res;
+    struct MemoryStruct chunk;
+    double ph_setting = target_ph;  // 기본값 유지
+    
+    chunk.memory = malloc(1);
+    chunk.size = 0;
+    
+    curl = curl_easy_init();
+    if(curl) {
+        curl_easy_setopt(curl, CURLOPT_URL, "http://localhost:5000/api/settings/ph");
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
+        
+        struct curl_slist *headers = NULL;
+        headers = curl_slist_append(headers, "Authorization: Bearer your_auth_token");
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+        
+        res = curl_easy_perform(curl);
+        
+        if(res == CURLE_OK) {
+            json_object *json = json_tokener_parse(chunk.memory);
+            json_object *data, *target_value;
+            if(json_object_object_get_ex(json, "data", &data) &&
+               json_object_object_get_ex(data, "target_value", &target_value)) {
+                ph_setting = json_object_get_double(target_value);
+            }
+            json_object_put(json);
+        }
+        
+        curl_easy_cleanup(curl);
+        curl_slist_free_all(headers);
+    }
+    
+    free(chunk.memory);
+    return ph_setting;
+}
+
+// pH 측정값 가져오기
+double fetch_current_ph() {
+    CURL *curl;
+    CURLcode res;
+    struct MemoryStruct chunk;
+    double current_ph = 7.0;  // 기본값
+    
+    chunk.memory = malloc(1);
+    chunk.size = 0;
+    
+    curl = curl_easy_init();
+    if(curl) {
+        curl_easy_setopt(curl, CURLOPT_URL, "http://localhost:5000/api/sensors/ph/latest");
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
+        
+        struct curl_slist *headers = NULL;
+        headers = curl_slist_append(headers, "Authorization: Bearer your_auth_token");
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+        
+        res = curl_easy_perform(curl);
+        
+        if(res == CURLE_OK) {
+            json_object *json = json_tokener_parse(chunk.memory);
+            json_object *data, *value;
+            if(json_object_object_get_ex(json, "data", &data) &&
+               json_object_object_get_ex(data, "value", &value)) {
+                current_ph = json_object_get_double(value);
+            }
+            json_object_put(json);
+        }
+        
+        curl_easy_cleanup(curl);
+        curl_slist_free_all(headers);
+    }
+    
+    free(chunk.memory);
+    return current_ph;
+}
 
 // 이동 평균 필터 초기화
 void initMovingAverage(MovingAverage* filter) {
@@ -55,41 +166,14 @@ void sigintHandler(int sig_num) {
     running = 0;
 }
 
-// ADC 읽기 함수 수정
-uint16_t readADC(int channel) {
-    uint8_t buffer[3];
-    buffer[0] = 1;
-    buffer[1] = (8 + channel) << 4;
-    buffer[2] = 0;
-
-    wiringPiSPIDataRW(SPI_CHANNEL, buffer, 3);
-    return ((buffer[1] & 3) << 8) + buffer[2];
-}
-
-// ADC 평균값 읽기 함수 수정
-uint16_t readADCAvg(int channel, int samples) {
-    uint32_t total = 0;
-    for (int i = 0; i < samples; i++) {
-        total += readADC(channel);
-        usleep(2000); // 2ms 딜레이
-    }
-    return total / samples;
-}
-
-// pH 변환 함수 수정
-double convertToPH(double voltage) {
-    // 전압 차이를 pH 차이로 변환 (1000을 곱하여 V를 mV로 변환)
-    double pH = REFERENCE_PH - ((voltage - REFERENCE_VOLTAGE) * 1000.0 / SLOPE);
-    return pH;
-}
-
 int main() {
-    // wiringPi 초기화를 GPIO 번호 모드로 변경
-    if (wiringPiSetupGpio() == -1) {  // wiringPiSetup() 대신 wiringPiSetupGpio() 사용
+    // wiringPi 초기화
+    if (wiringPiSetupGpio() == -1) {
         printf("초기화 실패\n");
         return -1;
     }
 
+    // SPI 초기화
     if (wiringPiSPISetup(SPI_CHANNEL, SPI_SPEED) == -1) {
         printf("SPI 초기화 실패\n");
         return -1;
@@ -99,64 +183,45 @@ int main() {
     pinMode(PUMPS_RELAY_PIN, OUTPUT);
     digitalWrite(PUMPS_RELAY_PIN, LOW);  // 초기 상태는 펌프 끄기
 
-    // 릴레이 초기 상태 확인을 위한 테스트
-    printf("릴레이 테스트 시작...\n");
-    digitalWrite(PUMPS_RELAY_PIN, HIGH);
-    printf("릴레이 ON\n");
-    sleep(2);
-    digitalWrite(PUMPS_RELAY_PIN, LOW);
-    printf("릴레이 OFF\n");
-    sleep(2);
-
     // Ctrl+C 핸들러 설정
     signal(SIGINT, sigintHandler);
 
     // 이동 평균 필터 초기화
     MovingAverage phFilter;
-    MovingAverage waterLevelFilter;
     initMovingAverage(&phFilter);
-    initMovingAverage(&waterLevelFilter);
 
-    printf("pH 및 수위 모니터링 시작... Ctrl+C로 종료\n");
+    printf("pH 모니터링 및 펌프 제어 시작... Ctrl+C로 종료\n");
 
+    int update_settings_counter = 0;
+    
     while (running) {
-        // pH 센서 읽기 (ADC 채널 0)
-        uint16_t phADC = readADCAvg(0, 50);
-        double phVoltage = (phADC / 1023.0) * 5.0;
-        double phValue = convertToPH(phVoltage);
+        // 10초마다 설정값 업데이트
+        if (update_settings_counter++ >= 10) {
+            target_ph = fetch_ph_setting();
+            update_settings_counter = 0;
+        }
+
+        // pH 측정값 가져오기
+        double phValue = fetch_current_ph();
         double smoothedPH = addToMovingAverage(&phFilter, phValue);
 
-        // 수위 센서 읽기 (ADC 채널 1)
-        uint16_t waterADC = readADCAvg(1, 50);
-        double waterVoltage = (waterADC / 1023.0) * 5.0;
-        double smoothedWaterLevel = addToMovingAverage(&waterLevelFilter, waterVoltage);
-
-        // 수위 상태 결정
-        const char* waterStatus;
-        if (waterVoltage > 3.35) {
-            waterStatus = "정상 수위";
-        } else if (waterVoltage < 2.95) {
-            waterStatus = "수위 부족";
+        // 상태 결정 및 펌프 제어
+        const char* water_status;
+        if (smoothedPH > target_ph + PH_TOLERANCE || smoothedPH < target_ph - PH_TOLERANCE) {
+            water_status = "물이 더러움 - 정화 필요";
+            digitalWrite(PUMPS_RELAY_PIN, HIGH);  // 펌프 켜기
+            printf("펌프 작동 중 - pH: %.2f (목표 pH: %.2f ± %.1f)\n", 
+                   smoothedPH, target_ph, PH_TOLERANCE);
         } else {
-            waterStatus = "경계 수위";
+            water_status = "물이 깨끗함";
+            digitalWrite(PUMPS_RELAY_PIN, LOW);   // 펌프 끄기
+            printf("정상 상태 - pH: %.2f (목표 pH: %.2f ± %.1f)\n", 
+                   smoothedPH, target_ph, PH_TOLERANCE);
         }
 
         // 상태 출력
-        printf("pH: %.2f, 수위: %.2fV (%s)\n", smoothedPH, smoothedWaterLevel, waterStatus);
-
-        // 펌프 제어 ���직
-        if (smoothedPH < PH_THRESHOLD && smoothedWaterLevel > WATER_LEVEL_LOW) {
-            digitalWrite(PUMPS_RELAY_PIN, HIGH);
-            printf("펌프 작동 중 (pH 낮음)\n");
-        } else {
-            digitalWrite(PUMPS_RELAY_PIN, LOW);
-            if (smoothedPH < PH_THRESHOLD) {
-                printf("수위가 낮아 펌프 중지\n");
-            } else {
-                printf("pH 정상, 펌프 중지\n");
-            }
-        }
-
+        printf("pH: %.2f, 상태: %s\n", smoothedPH, water_status);
+        
         sleep(1);
     }
 

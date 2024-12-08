@@ -41,6 +41,43 @@ uint16_t read_adc_avg(int channel, float interval, float duration) {
     return total / total_samples;
 }
 
+// 전압을 수위 퍼센트로 변환하는 함수
+float calculate_water_level_percentage(int sensor_id, float voltage) {
+    float percentage = 0.0;
+    float base_voltage; // 'not submerged' 기준 전압
+    float reference_voltage; // 'mostly submerged' 기준 전압 (100% 기준점)
+    
+    if (sensor_id == 4) {
+        // 4번 센서: 1.5V가 0%, 3.0V가 100% 기준
+        base_voltage = 1.5;
+        reference_voltage = 3.0;
+    }
+    else if (sensor_id == 3) {
+        // 3번 센서: 2.5V가 0%, 3.0V가 100% 기준
+        base_voltage = 2.0;
+        reference_voltage = 3.5;
+    }
+    else {
+        // 1번, 2번 센서: 2.95V가 0%, 3.35V가 100% 기준
+        base_voltage = 2.95;
+        reference_voltage = 3.35;
+    }
+
+    // 기준 전압 미만이면 0% 처리
+    if (voltage <= base_voltage) {
+        return 0.0;
+    }
+        // 기준 전압 초과면 100% 처리
+    if (voltage >= reference_voltage) {
+        return 100.0;
+    }
+
+    // 전압에 따른 비율 계산 (100% 이상도 허용)
+    percentage = ((voltage - base_voltage) / (reference_voltage - base_voltage)) * 100.0;
+    
+    return percentage;
+}
+
 void sigintHandler(int sig_num) {
     running = 0;
 }
@@ -78,6 +115,9 @@ int main() {
             // ADC 값을 전압으로 변환 (5V 기준)
             float voltage = (adc_value / 1023.0) * 5.0;
             
+            // 수위 퍼센트 계산
+            float water_level = calculate_water_level_percentage(sensor_id, voltage);
+            
             // 수위 상태 결정
             const char* water_status;
             if (sensor_id == 4) {  // 4번 센서용 특별 임계값
@@ -109,8 +149,8 @@ int main() {
             }
 
             // 결과 출력
-            printf("Sensor %d: Raw ADC: %d, Voltage: %.2f V, Status: %s\n",
-                   sensor_id, adc_value, voltage, water_status);
+            printf("Sensor %d: Raw ADC: %d, Voltage: %.2f V, Water Level: %.1f%%, Status: %s\n",
+                   sensor_id, adc_value, voltage, water_level, water_status);
         }
         
         // 구분선 출력

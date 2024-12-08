@@ -63,10 +63,10 @@ uint16_t readADCAvg(int channel, int samples) {
     return total / samples;
 }
 
-// 전압을 pH로 변환 (4.02V = pH 6.48 기준점 사용)
+// 전압을 pH로 변환 (4.99V = pH 6.00 기준점 사용)
 double convertToPH(double voltage) {
-    const double REFERENCE_VOLTAGE = 4.02;  // 기준 전압
-    const double REFERENCE_PH = 6.48;       // 기준 pH
+    const double REFERENCE_VOLTAGE = 4.99;  // 기준 전압
+    const double REFERENCE_PH = 6.00;       // 기준 pH
     const double SLOPE = -59.2;             // mV/pH at 25°C (네른스트 방정식)
 
     // 전압 차이를 pH 차이로 변환 (1000을 곱하여 V를 mV로 변환)

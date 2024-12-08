@@ -1,3 +1,21 @@
+// <사용 예시>
+// # 수위 센서의 level_low 설정값을 5로 변경
+// curl -X PUT \
+//   http://localhost:5000/api/sensor-settings/water_level/level_low \
+//   -H 'Authorization: Bearer your_auth_token' \
+//   -H 'Content-Type: application/json' \
+//   -d '{"value": 5}'
+
+// # 응답
+// {
+//   "message": "Setting updated successfully",
+//   "sensor_type": "water_level",
+//   "setting_name": "level_low",
+//   "new_value": 5,
+//   "updated_at": "2024-03-20T09:30:00.000Z"
+// }
+
+
 require('dotenv').config();
 const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
@@ -30,7 +48,7 @@ if (!fs.existsSync(PHOTOS_DIR)) {
 const db = new sqlite3.Database('./sensor_data.db', (err) => {
     if (err) {
         console.error('❌ Database connection error:', err);
-        return;
+        process.exit(1);
     }
     console.log('✅ Successfully connected to the database');
     initializeTables();
@@ -128,14 +146,83 @@ function initializeTables() {
             }
         });
     });
+
+    // 테이블 생성 후 기본설정값 초기화
+    initializeDefaultSettings();
+}
+
+// 기본 센서 설정값초기화 함수 추가
+function initializeDefaultSettings() {
+    const defaultSettings = [
+        // 카메라 설정
+        { sensor_type: 'camera', setting_name: 'capture_interval', setting_value: 3600 }, // 초 단위
+
+        // 먹이 모터 설정
+        { sensor_type: 'feed', setting_name: 'feed_interval', setting_value: 43200 }, // 12시간(초)
+
+        // 기포 발생기 설정
+        { sensor_type: 'air_pump', setting_name: 'ph_threshold_min', setting_value: 6.5 },
+        { sensor_type: 'air_pump', setting_name: 'ph_threshold_max', setting_value: 7.5 },
+        { sensor_type: 'air_pump', setting_name: 'conductivity_threshold_min', setting_value: 100 },
+        { sensor_type: 'air_pump', setting_name: 'conductivity_threshold_max', setting_value: 500 },
+
+        // 수위 센서 설정
+        { sensor_type: 'water_level', setting_name: 'level_low', setting_value: 10 },
+        { sensor_type: 'water_level', setting_name: 'level_normal', setting_value: 20 },
+        { sensor_type: 'water_level', setting_name: 'level_high', setting_value: 30 },
+
+        // pH 센서 설정
+        { sensor_type: 'ph', setting_name: 'sensing_interval', setting_value: 300 }, // 5분(초)
+        { sensor_type: 'ph', setting_name: 'alert_min', setting_value: 6.0 },
+        { sensor_type: 'ph', setting_name: 'alert_max', setting_value: 8.0 },
+
+        // 전도도 센서 설정
+        { sensor_type: 'conductivity', setting_name: 'sensing_interval', setting_value: 300 },
+
+        // 조도 센서 설정
+        { sensor_type: 'illuminance', setting_name: 'sensing_interval', setting_value: 300 },
+        { sensor_type: 'illuminance', setting_name: 'alert_max', setting_value: 1000 },
+
+        // 수온 센서 설정
+        { sensor_type: 'water_temperature', setting_name: 'sensing_interval', setting_value: 300 },
+        { sensor_type: 'water_temperature', setting_name: 'alert_min', setting_value: 20 },
+        { sensor_type: 'water_temperature', setting_name: 'alert_max', setting_value: 30 }
+    ];
+
+    const stmt = db.prepare(`
+        INSERT OR REPLACE INTO tb_sensor_settings 
+        (sensor_type, setting_name, setting_value, updated_at)
+        VALUES (?, ?, ?, datetime('now'))
+    `);
+
+    db.serialize(() => {
+        db.run('BEGIN TRANSACTION');
+        defaultSettings.forEach(setting => {
+            stmt.run(setting.sensor_type, setting.setting_name, setting.setting_value, (err) => {
+                if (err) {
+                    db.run('ROLLBACK');
+                    console.error('Error inserting default settings:', err);
+                    return;
+                }
+            });
+        });
+        db.run('COMMIT');
+    });
+
+    stmt.finalize();
 }
 
 // 세션 설정
+const isProduction = process.env.NODE_ENV === 'production';
 app.use(session({
     secret: process.env.SESSION_SECRET,
     resave: false,
     saveUninitialized: true,
-    cookie: { secure: false }
+    cookie: { 
+        secure: isProduction,
+        httpOnly: true,
+        sameSite: 'strict'
+    }
 }));
 
 // 인증 미들웨어
@@ -153,138 +240,193 @@ app.use((req, res, next) => {
     next();
 });
 
-// 데이터 조회 함수
-const fetchData = (tableName, params, callback) => {
-    const tables = [
-        'tb_ph', 'tb_water_level', 'tb_water_temperature', 
-        'tb_illuminance', 'tb_conductivity', 'tb_air_pump',
-        'tb_water_pump', 'tb_alert', 'tb_feed'
-    ];
-
-    if (!tables.includes(tableName)) {
-        return callback(new Error('Invalid table name'), null);
-    }
-
-    let query = `SELECT *, '${tableName}' as table_name FROM ${tableName}`;
-    const queryParams = [];
-
-    if (params.start && params.end) {
-        query += ` WHERE timestamp BETWEEN ? AND ?`;
-        queryParams.push(params.start, params.end);
-    }
-
-    query += ` ORDER BY timestamp DESC`;
-    
-    if (params.limit && params.offset) {
-        query += ` LIMIT ? OFFSET ?`;
-        queryParams.push(parseInt(params.limit), parseInt(params.offset));
-    }
-
-    db.all(query, queryParams, callback);
-};
-
-// API 엔드포인트 생성
-const createEndpoint = (tableName) => {
-    app.get(`/api/${tableName}`, (req, res) => {
-        const { limit, offset, start, end } = req.query;
-
-        fetchData(tableName, { limit, offset, start, end }, (err, rows) => {
-            if (err) {
-                res.status(500).json({ 
-                    error: `Error fetching data from ${tableName}`, 
-                    details: err.message 
-                });
-            } else if (!rows.length) {
-                res.status(404).json({ 
-                    table: tableName,
-                    error: `No data found in ${tableName}` 
-                });
-            } else {
-                res.json({
-                    table: tableName,
-                    data: rows
-                });
-            }
-        });
-    });
-};
-
-// 모든 테이블에 대한 엔드포인트 생성
-[
-    'tb_ph', 'tb_water_level', 'tb_water_temperature', 
-    'tb_illuminance', 'tb_conductivity', 'tb_air_pump',
-    'tb_water_pump', 'tb_alert', 'tb_feed'
-].forEach(createEndpoint);
-
 // POST 요청을 위한 JSON 파서 미들웨어 추가
 app.use(express.json());
+
+// 센서 데이터 저장 API 엔드포인트
+app.post('/api/sensor-data/:sensorType', (req, res) => {
+    const { sensorType } = req.params;
+    const sensorData = req.body;
+    
+    // 센서 타입별 테이블 매핑
+    const tableMap = {
+        'ph': 'tb_ph',
+        'water_level': 'tb_water_level',
+        'water_temperature': 'tb_water_temperature',
+        'illuminance': 'tb_illuminance',
+        'conductivity': 'tb_conductivity'
+    };
+
+    const tableName = tableMap[sensorType];
+    if (!tableName) {
+        return res.status(400).json({ error: 'Invalid sensor type' });
+    }
+
+    // 데이터 유효성 검사 및 변환 함수
+    const validateAndTransform = (data) => {
+        switch(sensorType) {
+            case 'ph':
+                return {
+                    timestamp: data.timestamp,
+                    sensor_id: data.sensor_id,
+                    location: data.location,
+                    pH_value: parseFloat(data.pH_value),
+                    voltage: parseFloat(data.voltage)
+                };
+            case 'water_level':
+                return {
+                    timestamp: data.timestamp,
+                    sensor_id: data.sensor_id,
+                    location: data.location,
+                    water_level: parseFloat(data.water_level),
+                    voltage: parseFloat(data.voltage)
+                };
+            case 'water_temperature':
+                return {
+                    timestamp: data.timestamp,
+                    sensor_id: data.sensor_id,
+                    location: data.location,
+                    temperature: parseFloat(data.temp_value),
+                    voltage: parseFloat(data.voltage || 0) // 옵셔널
+                };
+            case 'illuminance':
+                return {
+                    timestamp: data.timestamp,
+                    sensor_id: data.sensor_id,
+                    location: data.location,
+                    illuminance: parseFloat(data.light_value),
+                    voltage: parseFloat(data.voltage || 0)
+                };
+            case 'conductivity':
+                return {
+                    timestamp: data.timestamp,
+                    sensor_id: data.sensor_id,
+                    location: data.location,
+                    conductivity: parseFloat(data.tds_value),
+                    voltage: parseFloat(data.voltage || 0)
+                };
+            default:
+                throw new Error('Invalid sensor type');
+        }
+    };
+
+    try {
+        const transformedData = validateAndTransform(sensorData);
+        
+        // 데이터베이스에 저장
+        const columns = Object.keys(transformedData).join(', ');
+        const placeholders = Object.keys(transformedData).map(() => '?').join(', ');
+        const values = Object.values(transformedData);
+
+        db.run(
+            `INSERT INTO ${tableName} (${columns}) VALUES (${placeholders})`,
+            values,
+            function(err) {
+                if (err) {
+                    res.status(500).json({ error: 'Failed to save sensor data', details: err.message });
+                } else {
+                    res.json({ 
+                        message: 'Sensor data saved successfully',
+                        id: this.lastID
+                    });
+                }
+            }
+        );
+    } catch (err) {
+        res.status(400).json({ error: 'Invalid sensor data format', details: err.message });
+    }
+});
 
 // 센서 설정값 조회 API
 app.get('/api/sensor-settings/:sensorType', (req, res) => {
     const { sensorType } = req.params;
     
     db.all(
-        'SELECT * FROM tb_sensor_settings WHERE sensor_type = ?',
+        'SELECT * FROM tb_sensor_settings WHERE sensor_type = ? ORDER BY setting_name',
         [sensorType],
         (err, rows) => {
             if (err) {
                 res.status(500).json({ error: 'Database error', details: err.message });
+            } else if (rows.length === 0) {
+                res.status(404).json({ error: 'No settings found for this sensor type' });
             } else {
-                res.json({ settings: rows });
+                res.json({ 
+                    sensor_type: sensorType,
+                    settings: rows 
+                });
+            }
+        }
+    );
+});
+
+// 특정 센서의 특정 설정값 조회 API
+app.get('/api/sensor-settings/:sensorType/:settingName', (req, res) => {
+    const { sensorType, settingName } = req.params;
+    
+    db.get(
+        'SELECT * FROM tb_sensor_settings WHERE sensor_type = ? AND setting_name = ?',
+        [sensorType, settingName],
+        (err, row) => {
+            if (err) {
+                res.status(500).json({ error: 'Database error', details: err.message });
+            } else if (!row) {
+                res.status(404).json({ error: 'Setting not found' });
+            } else {
+                res.json(row);
             }
         }
     );
 });
 
 // 센서 설정값 업데이트 API
-app.post('/api/sensor-settings/:sensorType', (req, res) => {
-    const { sensorType } = req.params;
-    const { settings } = req.body;
+app.put('/api/sensor-settings/:sensorType/:settingName', (req, res) => {
+    const { sensorType, settingName } = req.params;
+    const { value } = req.body;
     
-    if (!settings || !Array.isArray(settings)) {
-        return res.status(400).json({ error: 'Invalid settings format' });
+    // 값 유효성 검사
+    if (value === undefined || value === null) {
+        return res.status(400).json({ error: 'Setting value is required' });
+    }
+
+    // 숫자 값으로 변환 시도
+    const numericValue = Number(value);
+    if (isNaN(numericValue)) {
+        return res.status(400).json({ error: 'Setting value must be a number' });
     }
 
     const timestamp = new Date().toISOString();
-    
-    // 트랜잭션 시작
-    db.serialize(() => {
-        db.run('BEGIN TRANSACTION');
 
-        try {
-            settings.forEach(setting => {
-                db.run(
-                    `INSERT INTO tb_sensor_settings (sensor_type, setting_name, setting_value, updated_at)
-                     VALUES (?, ?, ?, ?)
-                     ON CONFLICT(sensor_type, setting_name) 
-                     DO UPDATE SET setting_value = ?, updated_at = ?`,
-                    [sensorType, setting.name, setting.value, timestamp, setting.value, timestamp]
-                );
-            });
-
-            db.run('COMMIT', (err) => {
-                if (err) {
-                    throw err;
-                }
-                res.json({ 
-                    message: 'Settings updated successfully',
-                    sensorType,
-                    timestamp 
+    db.run(
+        `UPDATE tb_sensor_settings 
+         SET setting_value = ?, updated_at = ? 
+         WHERE sensor_type = ? AND setting_name = ?`,
+        [numericValue, timestamp, sensorType, settingName],
+        function(err) {
+            if (err) {
+                res.status(500).json({ 
+                    error: 'Database error', 
+                    details: err.message 
                 });
-            });
-        } catch (err) {
-            db.run('ROLLBACK');
-            res.status(500).json({ 
-                error: 'Failed to update settings',
-                details: err.message 
-            });
+            } else if (this.changes === 0) {
+                res.status(404).json({ 
+                    error: 'Setting not found',
+                    message: `No setting found for sensor type '${sensorType}' with name '${settingName}'`
+                });
+            } else {
+                res.json({ 
+                    message: 'Setting updated successfully',
+                    sensor_type: sensorType,
+                    setting_name: settingName,
+                    new_value: numericValue,
+                    updated_at: timestamp
+                });
+            }
         }
-    });
+    );
 });
 
+// 최근 사진 조회 API
 app.get('/api/latest-photo', (req, res) => {
-    const PHOTOS_DIR = path.join(__dirname, 'photos');
-
     fs.readdir(PHOTOS_DIR, (err, files) => {
         if (err) {
             return res.status(500).json({ error: 'Failed to read directory' });
