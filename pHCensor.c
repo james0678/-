@@ -44,13 +44,20 @@ double addToMovingAverage(MovingAverage* filter, double value) {
 
 // ADC 읽기
 uint16_t readADC(int channel) {
-    uint8_t buffer[3];
-    buffer[0] = 1;
-    buffer[1] = (8 + channel) << 4;
-    buffer[2] = 0;
+    if (channel < 0 || channel > 7) return 0;
 
+    uint8_t buffer[3];
+    buffer[0] = 0x01;  // 시작 비트
+    buffer[1] = 0x80 | ((channel & 0x07) << 4);  // 단일 엔드 + 채널 선택
+    buffer[2] = 0x00;
+
+    printf("전송 전: %02x %02x %02x\n", buffer[0], buffer[1], buffer[2]);
     wiringPiSPIDataRW(SPI_CHANNEL, buffer, 3);
-    return ((buffer[1] & 3) << 8) + buffer[2];
+    printf("수신 후: %02x %02x %02x\n", buffer[0], buffer[1], buffer[2]);
+
+    // 10비트 값 추출 방식 변경
+    uint16_t value = ((buffer[1] & 0x03) << 8) | buffer[2];
+    return value;
 }
 
 // 평균 ADC 값 읽기
@@ -80,12 +87,20 @@ void sigintHandler(int sig_num) {
 }
 
 int main() {
-    // SPI 초기화
-    if (wiringPiSPISetup(SPI_CHANNEL, SPI_SPEED) == -1) {
+    // wiringPi 초기화
+    if (wiringPiSetupGpio() == -1) {
+        printf("GPIO 초기화 실패\n");
+        return -1;
+    }
+
+    // SPI 속도를 더 낮춰서 시도 (1MHz)
+    if (wiringPiSPISetup(SPI_CHANNEL, 1000000) == -1) {
         printf("SPI 초기화 실패\n");
         return -1;
     }
 
+    printf("SPI 초기화 성공\n");
+    
     // Ctrl+C 핸들러 설정
     signal(SIGINT, sigintHandler);
 

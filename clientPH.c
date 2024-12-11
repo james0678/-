@@ -1,106 +1,70 @@
-// # 필요한 라이브러리 설치
-// sudo apt-get install libjson-c-dev wiringpi
-
-// # 컴파일
-// gcc -o clientPH clientPH.c -lwiringPi -ljson-c
-
-// # 실행 (서버 IP 주소 필요)
-// ./clientPH 192.168.14.17
-
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <unistd.h>
-#include <arpa/inet.h>
-#include <json-c/json.h>
-#include <time.h>
-#include <wiringPi.h>
-#include <ads1115.h>
+#include <bcm2835.h>
 #include <signal.h>
-
-#define PORT 8080
-#define MAX_IP_LENGTH 16
-#define ADS1115_ADDRESS 0x48
-#define ADS1115_CHANNEL 0
+#include <stdint.h>
 
 static int running = 1;
 
-void send_sensor_data(const char* server_ip, float pH_value, float voltage) {
-    int sock = 0;
-    struct sockaddr_in serv_addr;
-    
-    if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        printf("Socket creation error\n");
-        return;
-    }
-    
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(PORT);
-    
-    if (inet_pton(AF_INET, server_ip, &serv_addr.sin_addr) <= 0) {
-        printf("Invalid address: %s\n", server_ip);
-        close(sock);
-        return;
-    }
-    
-    if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-        printf("Connection Failed\n");
-        close(sock);
-        return;
-    }
-    
-    // 현재 시간 생성 (형식: YYYY-MM-DDTHH:MM:SS)
-    time_t now = time(NULL);
-    char timestamp[32];
-    strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%S", localtime(&now));
-    
-    // JSON 데이터 생성 (단순화된 형식)
-    struct json_object *json_obj = json_object_new_object();
-    json_object_object_add(json_obj, "timestamp", json_object_new_string(timestamp));
-    json_object_object_add(json_obj, "pH_value", json_object_new_double(pH_value));
-    json_object_object_add(json_obj, "voltage", json_object_new_double(voltage));
-    
-    const char *json_str = json_object_to_json_string(json_obj);
-    send(sock, json_str, strlen(json_str), 0);
-    
-    printf("Sent data: pH: %.2f, Voltage: %.2fV\n", pH_value, voltage);
-    
-    json_object_put(json_obj);
-    close(sock);
+// ADC 값 읽기
+uint16_t read_adc(void) {
+    uint8_t buffer[3] = {0};
+    buffer[0] = 0x01;  // Start bit
+    buffer[1] = 0x80;  // Single-ended, channel 0
+    buffer[2] = 0x00;
+
+    bcm2835_spi_transfern((char*)buffer, 3);
+    return ((buffer[1] & 0x03) << 8) + buffer[2];
 }
 
 void sigintHandler(int sig_num) {
     running = 0;
 }
 
-int main(int argc, char *argv[]) {
-    if (argc != 2) {
-        printf("Usage: %s <server_ip>\n", argv[0]);
-        return 1;
+int main() {
+    if (!bcm2835_init()) {
+        printf("bcm2835 초기화 실패\n");
+        return -1;
     }
 
-    char *server_ip = argv[1];
-    printf("Starting pH monitoring for server at %s:%d\n", server_ip, PORT);
-
-    if (wiringPiSetup() == -1) {
-        printf("WiringPi 초기화 실패\n");
-        return 1;
+    if (!bcm2835_spi_begin()) {
+        printf("SPI 초기화 실패\n");
+        bcm2835_close();
+        return -1;
     }
 
-    ads1115Setup(ADS1115_ADDRESS, ADS1115_CHANNEL);
+    bcm2835_spi_setBitOrder(BCM2835_SPI_BIT_ORDER_MSBFIRST);
+    bcm2835_spi_setDataMode(BCM2835_SPI_MODE0);
+    bcm2835_spi_setClockDivider(BCM2835_SPI_CLOCK_DIVIDER_256);
+    bcm2835_spi_chipSelect(BCM2835_SPI_CS0);
     
-    // Ctrl+C 핸들러 설정
     signal(SIGINT, sigintHandler);
+    printf("Starting pH monitoring... Press Ctrl+C to exit.\n");
 
     while (running) {
-        int adc_value = analogRead(ADS1115_CHANNEL);
-        float voltage = adc_value * (4.096 / 32767.0);
-        float ph_value = 7.0 + ((2.5 - voltage) / 0.18);
+        // 10개 샘플의 평균 구하기
+        uint32_t adc_sum = 0;
+        for (int i = 0; i < 10; i++) {
+            adc_sum += read_adc();
+            usleep(10000);  // 10ms 대기
+        }
+        uint16_t adc_avg = adc_sum / 10;
         
-        send_sensor_data(server_ip, ph_value, voltage);
+        // 전압 계산 (5V 기준)
+        float voltage = (adc_avg / 1023.0) * 5.0;
+        
+        // pH 값 계산 (보정된 값 사용)
+        float ph = 7.0 + ((2.5 - voltage) / 0.18);
+        
+        // 결과 출력
+        printf("Voltage: %.2fV, pH: %.2f\n", voltage, ph);
+        
         sleep(1);
     }
-    
+
     printf("\nShutting down...\n");
+    bcm2835_spi_end();
+    bcm2835_close();
     return 0;
 }

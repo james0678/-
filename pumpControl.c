@@ -2,10 +2,10 @@
 // sudo apt-get install libcurl4-openssl-dev libjson-c-dev wiringpi
 
 // # 컴파일
-// gcc -o pumpControl pumpControl.c -lwiringPi -ljson-c -lcurl
+// gcc -o pumpControl pumpControl.c -lwiringPi -lsqlite3
 
 // # 실행
-// ./pumpControl
+// sudo ./pumpControl
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,8 +14,10 @@
 #include <wiringPi.h>
 #include <wiringPiSPI.h>
 #include <signal.h>
+#include <string.h>
 #include <curl/curl.h>
 #include <json-c/json.h>
+#include <sqlite3.h>
 
 #define SPI_CHANNEL 0
 #define SPI_SPEED 1350000
@@ -28,8 +30,13 @@
 #define SLOPE -59.2            // mV/pH at 25°C (네른스트 방정식)
 #define PH_TOLERANCE 0.5       // pH 허용 오차 범위
 
+// 상수 정의 수정
+#define TARGET_PH 7.0        // 목표 pH 값
+#define PH_MIN 6.5          // 최소 허용 pH
+#define PH_MAX 7.5          // 최대 허용 pH
+#define DB_PATH "/path/to/your/database.db"  // SQLite DB 경로
+
 static int running = 1;
-static double target_ph = 7.0;  // 초기 목표 pH 값
 
 // 이동 평균 필터 구조체
 typedef struct {
@@ -60,83 +67,27 @@ static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, voi
     return realsize;
 }
 
-// pH 설정값 가져오기
-double fetch_ph_setting() {
-    CURL *curl;
-    CURLcode res;
-    struct MemoryStruct chunk;
-    double ph_setting = target_ph;  // 기본값 유지
-    
-    chunk.memory = malloc(1);
-    chunk.size = 0;
-    
-    curl = curl_easy_init();
-    if(curl) {
-        curl_easy_setopt(curl, CURLOPT_URL, "http://localhost:5000/api/settings/ph");
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
-        
-        struct curl_slist *headers = NULL;
-        headers = curl_slist_append(headers, "Authorization: Bearer your_auth_token");
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-        
-        res = curl_easy_perform(curl);
-        
-        if(res == CURLE_OK) {
-            json_object *json = json_tokener_parse(chunk.memory);
-            json_object *data, *target_value;
-            if(json_object_object_get_ex(json, "data", &data) &&
-               json_object_object_get_ex(data, "target_value", &target_value)) {
-                ph_setting = json_object_get_double(target_value);
-            }
-            json_object_put(json);
-        }
-        
-        curl_easy_cleanup(curl);
-        curl_slist_free_all(headers);
-    }
-    
-    free(chunk.memory);
-    return ph_setting;
-}
-
 // pH 측정값 가져오기
 double fetch_current_ph() {
-    CURL *curl;
-    CURLcode res;
-    struct MemoryStruct chunk;
+    sqlite3 *db;
+    sqlite3_stmt *stmt;
     double current_ph = 7.0;  // 기본값
     
-    chunk.memory = malloc(1);
-    chunk.size = 0;
-    
-    curl = curl_easy_init();
-    if(curl) {
-        curl_easy_setopt(curl, CURLOPT_URL, "http://localhost:5000/api/sensors/ph/latest");
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
-        
-        struct curl_slist *headers = NULL;
-        headers = curl_slist_append(headers, "Authorization: Bearer your_auth_token");
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-        
-        res = curl_easy_perform(curl);
-        
-        if(res == CURLE_OK) {
-            json_object *json = json_tokener_parse(chunk.memory);
-            json_object *data, *value;
-            if(json_object_object_get_ex(json, "data", &data) &&
-               json_object_object_get_ex(data, "value", &value)) {
-                current_ph = json_object_get_double(value);
-            }
-            json_object_put(json);
-        }
-        
-        curl_easy_cleanup(curl);
-        curl_slist_free_all(headers);
+    if (sqlite3_open(DB_PATH, &db) != SQLITE_OK) {
+        printf("데이터베이스 열기 실패: %s\n", sqlite3_errmsg(db));
+        return current_ph;
     }
     
-    free(chunk.memory);
+    const char *sql = "SELECT ph_value FROM ph_measurements ORDER BY timestamp DESC LIMIT 1;";
+    
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            current_ph = sqlite3_column_double(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+    }
+    
+    sqlite3_close(db);
     return current_ph;
 }
 
@@ -183,6 +134,16 @@ int main() {
     pinMode(PUMPS_RELAY_PIN, OUTPUT);
     digitalWrite(PUMPS_RELAY_PIN, LOW);  // 초기 상태는 펌프 끄기
 
+    // 펌프 연결 테스트
+    printf("수중 펌프 연결 테스트 시작...\n");
+    printf("펌프 켜기...\n");
+    digitalWrite(PUMPS_RELAY_PIN, HIGH);
+    sleep(1);
+    printf("펌프 끄기...\n");
+    digitalWrite(PUMPS_RELAY_PIN, LOW);
+    sleep(1);
+    printf("펌프 테스트 완료!\n\n");
+
     // Ctrl+C 핸들러 설정
     signal(SIGINT, sigintHandler);
 
@@ -192,31 +153,23 @@ int main() {
 
     printf("pH 모니터링 및 펌프 제어 시작... Ctrl+C로 종료\n");
 
-    int update_settings_counter = 0;
-    
     while (running) {
-        // 10초마다 설정값 업데이트
-        if (update_settings_counter++ >= 10) {
-            target_ph = fetch_ph_setting();
-            update_settings_counter = 0;
-        }
-
         // pH 측정값 가져오기
         double phValue = fetch_current_ph();
         double smoothedPH = addToMovingAverage(&phFilter, phValue);
 
         // 상태 결정 및 펌프 제어
         const char* water_status;
-        if (smoothedPH > target_ph + PH_TOLERANCE || smoothedPH < target_ph - PH_TOLERANCE) {
+        if (smoothedPH < PH_MIN || smoothedPH > PH_MAX) {
             water_status = "물이 더러움 - 정화 필요";
             digitalWrite(PUMPS_RELAY_PIN, HIGH);  // 펌프 켜기
-            printf("펌프 작동 중 - pH: %.2f (목표 pH: %.2f ± %.1f)\n", 
-                   smoothedPH, target_ph, PH_TOLERANCE);
+            printf("펌프 작동 중 - pH: %.2f (허용 범위: %.1f ~ %.1f)\n", 
+                   smoothedPH, PH_MIN, PH_MAX);
         } else {
             water_status = "물이 깨끗함";
             digitalWrite(PUMPS_RELAY_PIN, LOW);   // 펌프 끄기
-            printf("정상 상태 - pH: %.2f (목표 pH: %.2f ± %.1f)\n", 
-                   smoothedPH, target_ph, PH_TOLERANCE);
+            printf("정상 상태 - pH: %.2f (허용 범위: %.1f ~ %.1f)\n", 
+                   smoothedPH, PH_MIN, PH_MAX);
         }
 
         // 상태 출력

@@ -1,0 +1,7 @@
+{
+  "files.associations": {
+    "inet.h": "c",
+    "wiringpispi.h": "c",
+    "stdio.h": "c"
+  }
+}
